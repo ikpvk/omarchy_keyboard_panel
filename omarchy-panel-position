@@ -1,0 +1,257 @@
+#!/bin/bash
+
+# Style -> Panel Position for the Omarchy shell.
+#
+# Adds a menu setting that opens bar panels (KeyboardPanel.qml) either under
+# their bar icon (Omarchy default) or centred on the screen.
+#
+#   omarchy-panel-position install          Add menu entries + update hook, patch the shell
+#   omarchy-panel-position uninstall        Remove all of it and restore Omarchy's KeyboardPanel.qml
+#   omarchy-panel-position set default|centre
+#   omarchy-panel-position status
+#   omarchy-panel-position reapply          Re-patch after an Omarchy update (run by the hook)
+
+set -uo pipefail
+
+TARGET=/usr/share/omarchy/shell/Ui/KeyboardPanel.qml
+SETTING="$HOME/.config/omarchy/panel-position"
+STATE_DIR="$HOME/.local/share/omarchy-panel-position"
+BACKUP="$STATE_DIR/KeyboardPanel.qml.orig"
+BACKUP_VERSION="$STATE_DIR/omarchy-version"
+MENU="$HOME/.config/omarchy/extensions/omarchy-menu.jsonc"
+HOOK="$HOME/.config/omarchy/hooks/post-update.d/panel-position"
+SELF="$HOME/.local/bin/omarchy-panel-position"
+MARKER="omarchy-panel-position"
+
+say() { echo "panel-position: $*"; }
+warn() {
+  echo "panel-position: $*" >&2
+  notify-send -u critical "Panel position" "$*" 2>/dev/null || true
+}
+
+as_root() {
+  if [[ -t 0 ]] && command -v sudo >/dev/null; then
+    sudo "$@"
+  else
+    pkexec "$@"
+  fi
+}
+
+omarchy_version() { pacman -Q omarchy 2>/dev/null | awk '{print $2}'; }
+is_patched() { grep -q "$MARKER" "$TARGET" 2>/dev/null; }
+is_pristine() { ! pacman -Qkk omarchy 2>/dev/null | grep -q "$TARGET"; }
+
+current_setting() {
+  local value
+  value=$(tr -d '[:space:]' <"$SETTING" 2>/dev/null)
+  [[ $value == centre || $value == center ]] && echo centre || echo default
+}
+
+write_setting() {
+  mkdir -p "$(dirname "$SETTING")"
+  # Write in place (no mv) so the shell's file watcher keeps the same inode.
+  printf '%s\n' "$1" >"$SETTING"
+}
+
+# Prints the patched file on stdout; exits non-zero if the expected code is not found.
+render_patch() {
+  python3 -I - "$1" <<'PY'
+import sys
+
+src = open(sys.argv[1], encoding="utf-8").read()
+
+import_anchor = "import Quickshell.Wayland\n"
+origin_anchor = (
+    "  readonly property point cardOrigin: {\n"
+    "    if (!anchorItem || !bar) return Qt.point(margin, margin)\n"
+)
+
+if src.count(import_anchor) != 1 or src.count(origin_anchor) != 1:
+    sys.exit(1)
+
+src = src.replace(import_anchor, import_anchor + "import Quickshell.Io // omarchy-panel-position\n")
+src = src.replace(origin_anchor, """  // omarchy-panel-position: begin
+  // "centre" in ~/.config/omarchy/panel-position opens the card in the middle
+  // of the screen instead of under its bar icon.
+  property bool panelPositionCentred: false
+  FileView {
+    path: Quickshell.env("HOME") + "/.config/omarchy/panel-position"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var value = String(text()).trim()
+      root.panelPositionCentred = value === "centre" || value === "center"
+    }
+    onLoadFailed: root.panelPositionCentred = false
+  }
+  // omarchy-panel-position: end
+  readonly property point cardOrigin: {
+    if (panelPositionCentred && screenW > 0 && screenH > 0) // omarchy-panel-position
+      return Qt.point(Math.round(Math.max(margin, (screenW - contentWidth) / 2)),
+                      Math.round(Math.max(margin, (screenH - contentHeight) / 2)))
+    if (!anchorItem || !bar) return Qt.point(margin, margin)
+""")
+
+sys.stdout.write(src)
+PY
+}
+
+patch_shell() {
+  if is_patched; then
+    say "KeyboardPanel.qml already patched"
+    return 0
+  fi
+
+  if ! is_pristine; then
+    warn "KeyboardPanel.qml differs from the omarchy package; not patching. Reinstall omarchy to restore it."
+    return 1
+  fi
+
+  local tmp
+  tmp=$(mktemp) || return 1
+  if ! render_patch "$TARGET" >"$tmp"; then
+    rm -f "$tmp"
+    warn "Patch skipped: KeyboardPanel.qml changed upstream. Panels will open in the default position."
+    return 1
+  fi
+
+  mkdir -p "$STATE_DIR"
+  cp "$TARGET" "$BACKUP"
+  omarchy_version >"$BACKUP_VERSION"
+
+  if ! as_root install -m 644 "$tmp" "$TARGET"; then
+    rm -f "$tmp"
+    warn "Could not write KeyboardPanel.qml (authentication failed or cancelled)."
+    return 1
+  fi
+  rm -f "$tmp"
+  say "patched KeyboardPanel.qml (omarchy $(omarchy_version))"
+  return 0
+}
+
+restore_shell() {
+  if ! is_patched; then
+    say "KeyboardPanel.qml is already Omarchy's default"
+    return 0
+  fi
+
+  if [[ ! -f $BACKUP || $(cat "$BACKUP_VERSION" 2>/dev/null) != "$(omarchy_version)" ]]; then
+    warn "No backup matching omarchy $(omarchy_version). Restore with: sudo pacman -S omarchy (only if your system is fully up to date)."
+    return 1
+  fi
+
+  if ! as_root install -m 644 "$BACKUP" "$TARGET"; then
+    warn "Could not restore KeyboardPanel.qml (authentication failed or cancelled)."
+    return 1
+  fi
+
+  if is_pristine; then
+    say "restored Omarchy's KeyboardPanel.qml (verified against the package)"
+  else
+    warn "KeyboardPanel.qml restored but does not match the package checksum."
+    return 1
+  fi
+}
+
+add_menu() {
+  remove_menu
+  mkdir -p "$(dirname "$MENU")"
+  [[ -f $MENU ]] || printf '{\n}\n' >"$MENU"
+
+  local block
+  block=$(cat <<EOF
+  // $MARKER: begin (managed by omarchy-panel-position; remove with \`omarchy-panel-position uninstall\`)
+  "style.panel-position": {"icon":"󰖯","label":"Panel Position"},
+  "style.panel-position.default": {"icon":"󰁝","label":"Default","description":"Open panels under their bar icon","action":"\$HOME/.local/bin/omarchy-panel-position set default","checked":"[[ \$(\$HOME/.local/bin/omarchy-panel-position get) == default ]]"},
+  "style.panel-position.centre": {"icon":"󰁂","label":"Centre","description":"Open panels in the middle of the screen","action":"\$HOME/.local/bin/omarchy-panel-position set centre","checked":"[[ \$(\$HOME/.local/bin/omarchy-panel-position get) == centre ]]"},
+  // $MARKER: end
+EOF
+)
+
+  # Insert before the file's final closing brace.
+  python3 -I - "$MENU" "$block" <<'PY'
+import sys
+path, block = sys.argv[1], sys.argv[2]
+text = open(path, encoding="utf-8").read()
+end = text.rstrip().rfind("}")
+if end < 0:
+    sys.exit("menu file has no closing brace")
+head = text[:end].rstrip()
+if not head.endswith(("{", ",")):
+    head += ","
+open(path, "w", encoding="utf-8").write(head + "\n\n" + block + "\n" + text[end:])
+PY
+}
+
+remove_menu() {
+  [[ -f $MENU ]] || return 0
+  sed -i "/\/\/ $MARKER: begin/,/\/\/ $MARKER: end/d" "$MENU"
+  # Drop the blank line left behind before the closing brace.
+  python3 -I - "$MENU" <<'PY'
+import re, sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+open(path, "w", encoding="utf-8").write(re.sub(r"\n\n+(\}\s*)$", r"\n\1", text))
+PY
+}
+
+add_hook() {
+  mkdir -p "$(dirname "$HOOK")"
+  cat >"$HOOK" <<EOF
+#!/bin/bash
+# Re-applies Style -> Panel Position after Omarchy updates replace KeyboardPanel.qml.
+[[ -x "$SELF" ]] && "$SELF" reapply
+exit 0
+EOF
+  chmod +x "$HOOK"
+}
+
+restart_shell() { omarchy restart shell >/dev/null 2>&1 || true; }
+
+case "${1:-}" in
+  install)
+    [[ -f $SETTING ]] || write_setting default
+    add_menu && say "added Style -> Panel Position to the Omarchy menu"
+    add_hook && say "installed post-update hook"
+    patch_shell
+    restart_shell
+    say "current position: $(current_setting)"
+    ;;
+  uninstall)
+    remove_menu && say "removed Style -> Panel Position from the Omarchy menu"
+    rm -f "$HOOK" && say "removed post-update hook"
+    restore_shell || exit 1
+    rm -f "$SETTING"
+    rm -rf "$STATE_DIR"
+    restart_shell
+    say "uninstalled. Delete this script too with: rm $SELF"
+    ;;
+  reapply)
+    is_patched && exit 0
+    patch_shell && restart_shell
+    exit 0
+    ;;
+  set)
+    case "${2:-}" in
+      default | centre) write_setting "$2" ;;
+      center) write_setting centre ;;
+      *) echo "Usage: omarchy-panel-position set default|centre" >&2; exit 1 ;;
+    esac
+    is_patched || warn "Setting saved, but KeyboardPanel.qml is not patched. Run: omarchy-panel-position reapply"
+    ;;
+  get)
+    current_setting
+    ;;
+  status)
+    echo "position:     $(current_setting)"
+    echo "shell patch:  $(is_patched && echo applied || echo "not applied")"
+    echo "menu entries: $(grep -q "$MARKER" "$MENU" 2>/dev/null && echo installed || echo "not installed")"
+    echo "update hook:  $([[ -x $HOOK ]] && echo installed || echo "not installed")"
+    echo "omarchy:      $(omarchy_version)"
+    ;;
+  *)
+    sed -n '3,12p' "$0" | sed 's/^# \{0,1\}//'
+    exit 1
+    ;;
+esac

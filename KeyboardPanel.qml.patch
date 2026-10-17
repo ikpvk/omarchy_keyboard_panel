@@ -1,0 +1,37 @@
+--- a/shell/Ui/KeyboardPanel.qml
++++ b/shell/Ui/KeyboardPanel.qml
+@@ -1,6 +1,7 @@
+ import QtQuick
+ import Quickshell
+ import Quickshell.Wayland
++import Quickshell.Io // omarchy-panel-position
+ import qs.Commons
+ 
+ // Layer-shell popup attached to a bar widget icon, designed for
+@@ -191,7 +192,26 @@
+   // centering the card under the icon.
+   readonly property real barW: anchorWindow ? anchorWindow.width : screenW
+   readonly property real barH: anchorWindow ? anchorWindow.height : 0
++  // omarchy-panel-position: begin
++  // "centre" in ~/.config/omarchy/panel-position opens the card in the middle
++  // of the screen instead of under its bar icon.
++  property bool panelPositionCentred: false
++  FileView {
++    path: Quickshell.env("HOME") + "/.config/omarchy/panel-position"
++    watchChanges: true
++    printErrors: false
++    onFileChanged: reload()
++    onLoaded: {
++      var value = String(text()).trim()
++      root.panelPositionCentred = value === "centre" || value === "center"
++    }
++    onLoadFailed: root.panelPositionCentred = false
++  }
++  // omarchy-panel-position: end
+   readonly property point cardOrigin: {
++    if (panelPositionCentred && screenW > 0 && screenH > 0) // omarchy-panel-position
++      return Qt.point(Math.round(Math.max(margin, (screenW - contentWidth) / 2)),
++                      Math.round(Math.max(margin, (screenH - contentHeight) / 2)))
+     if (!anchorItem || !bar) return Qt.point(margin, margin)
+     var x = 0, y = 0
+     if (centerOnBar && (barPos === "top" || barPos === "bottom")) {
