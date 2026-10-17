@@ -101,3 +101,8 @@ sudo pacman -S omarchy
 - **This could become an upstream setting.** Omarchy already has a `centerOnBar` option in `KeyboardPanel`, so a
   setting such as `"panelPosition": "center"` in `shell.json` would fit naturally. If Omarchy adds one, uninstall
   this tool and use that setting.
+
+## License
+
+[MIT](LICENSE) © 2026 Krishna Prasad V K. `KeyboardPanel.qml.patch` modifies [Omarchy](https://github.com/basecamp/omarchy)'s
+`KeyboardPanel.qml`, which is also MIT-licensed.
